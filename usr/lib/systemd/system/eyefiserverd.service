@@ -1,0 +1,11 @@
+### Configuration
+
+[Unit]
+Description=EyeFi Server Daemon
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/bin/eyefiserver start -c /etc/eyefiserver.conf -l /var/log/eyefiserver.log -d 40
+ExecStop=/usr/bin/python3 /usr/bin/eyefiserver stop -c /etc/eyefiserver.conf -l /var/log/eyefiserver.log -d 40
+
+[Install]
+WantedBy=multi-user.target
