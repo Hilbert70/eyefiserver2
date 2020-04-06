@@ -1,8 +1,14 @@
-#!/usr/bin/env python
+#!/usr/bin/python3
 
 """
 * Copyright (c) 2009, Jeffrey Tchang
 * Additional *pike
+* Ported to python 3 by hilbert70
+* Added commandline stuff (argparse)
+* Geotagging will probably not work, I had no way to test that
+* Added debugging flag
+* Changed the demaon stuff, stop did not wrok, is working now
+*
 * All rights reserved.
 *
 *
@@ -18,276 +24,62 @@
 * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 
-
-import cgi
-import time
-from datetime import timedelta
-
-import random
 import sys
 import os
-import socket
-import thread
-import StringIO
-import traceback
-import errno
+import io
 import tempfile
+import psutil
+import errno
+import atexit
+import logging
+import logging.handlers
+import configparser
+import signal
+from signal import SIGTERM
+import time
+import argparse 
+import traceback
+
+import socketserver
+# use http.server instead of BaseHTTPServer
+#from http.server  import BaseHTTPRequestHandler, HTTPServer
+import http.server
+import xml.sax
+from xml.sax.handler import ContentHandler
+import xml.dom.minidom
 
 import hashlib
 import binascii
 import select
 import tarfile
+import random
+import cgi
+import datetime
 
-import xml.sax
-from xml.sax.handler import ContentHandler
-import xml.dom.minidom
+parser = argparse.ArgumentParser(description="This server will be up and Eye-Fi cards can connect to it.\n GeoTaggnig is proably not working, I could not test this.\nA full path to the configuriation path must be given.")
+argGroup = parser.add_mutually_exclusive_group(required=True)
+argGroup.add_argument("action",metavar="start",  help="Start the server", nargs="?", action="append" )
+argGroup.add_argument("action",metavar="stop",   help="Stop the server", nargs="?", action="append")
+argGroup.add_argument("action",metavar="restart",help="Restart the server",  nargs="?", action="append")
+argGroup.add_argument("action",metavar="reload", help="Reload the configuration", nargs="?", action="append")
+argGroup.add_argument("action",metavar="status", help="Show the status of the server", nargs="?", action="append")
+argGroup.add_argument("action",metavar="instance",  nargs="?", action="append")
+parser.add_argument("-c", "--configure", required=True, nargs=1)
+parser.add_argument("-l", "--logfile", required=True,nargs=1)
+parser.add_argument("-d", "--debug", default=0, type=int, help="Set debug level: \
+CRITICAL = 50, \
+ERROR = 40, \
+WARNING = 30, \
+INFO = 20, \
+DEBUG=10, \
+NOTSET=0")
+args = parser.parse_args()
 
-from BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
-import BaseHTTPServer
-import httplib
-
-import SocketServer
-
-import logging
-import logging.handlers
-
-import atexit
-from signal import SIGTERM
-import signal
-
-#pike
-from datetime import datetime
-import ConfigParser
-
-DEFAULTS = {'upload_uid': '-1', 'upload_gid': '-1', 'geotag_enable': '0'}
-
-import math
-
-class Daemon:
-    """
-    A generic daemon class.
-
-    Usage: subclass the Daemon class and override the run() method
-    """
-    def __init__(self,
-                 pidfile,
-                 stdin='/dev/null',
-                 stdout='/dev/null',
-                 stderr='/dev/null',
-                ):
-        try:
-            self.stderr = sys.argv[3]
-        except:
-            self.stderr = stderr
-        self.stdin = stdin
-        self.stdout = stdout
-        self.pidfile = pidfile
-
-    def daemonize(self):
-        """
-        do the UNIX double-fork magic, see Stevens' "Advanced
-        Programming in the UNIX Environment" for details (ISBN 0201563177)
-        http://www.erlenstar.demon.co.uk/unix/faq_2.html#SEC16
-        """
-        try:
-            pid = os.fork()
-            if pid > 0:
-                # exit first parent
-#                            sys.exit(0)
-                return 0
-        except OSError, e:
-            sys.stderr.write("fork #1 failed: %d (%s)\n" \
-                             % (e.errno, e.strerror))
-            sys.exit(1)
-
-        # decouple from parent environment
-        os.chdir("/")
-        os.setsid()
-        os.umask(0)
-
-        # do second fork
-        try:
-            pid = os.fork()
-            if pid > 0:
-                # exit from second parent
-#                            sys.exit(0)
-                return 1
-        except OSError, e:
-            sys.stderr.write("fork #2 failed: %d (%s)\n" \
-                             % (e.errno, e.strerror))
-            sys.exit(1)
-
-        # redirect standard file descriptors
-        sys.stdout.flush()
-        sys.stderr.flush()
-        si = file(self.stdin, 'r')
-        so = file(self.stdout, 'a+')
-        se = file(self.stderr, 'a+', 0)
-        os.dup2(si.fileno(), sys.stdin.fileno())
-        os.dup2(so.fileno(), sys.stdout.fileno())
-        os.dup2(se.fileno(), sys.stderr.fileno())
-
-        # write pidfile
-        atexit.register(self.delpid)
-        pid = str(os.getpid())
-        file(self.pidfile,'w+').write("%s\n" % pid)
-
-    def delpid(self):
-        os.remove(self.pidfile)
-
-    def start(self):
-        """
-        Start the daemon
-        """
-        # Check for a pidfile to see if the daemon already runs
-        try:
-            pf = file(self.pidfile,'r')
-            pid = int(pf.read().strip())
-            pf.close()
-        except IOError:
-            pid = None
-
-        if pid:
-            message = "pidfile %s already exist. Daemon already running?\n"
-            sys.stderr.write(message % self.pidfile)
-            return 1
-
-        # Start the daemon
-        forkresult = self.daemonize()
-        if forkresult==None:
-            self.run()
-        return forkresult
-
-    def stop(self):
-        """
-        Stop the daemon
-        """
-        # Get the pid from the pidfile
-        try:
-            pf = file(self.pidfile,'r')
-            pid = int(pf.read().strip())
-            pf.close()
-        except IOError:
-            pid = None
-
-        if not pid:
-            message = "pidfile %s does not exist. Daemon not running?\n"
-            sys.stderr.write(message % self.pidfile)
-            return 1
-
-        # Try killing the daemon process
-        try:
-            while 1:
-                os.kill(pid, SIGTERM)
-                time.sleep(0.1)
-        except OSError, err:
-            err = str(err)
-            if err.find("No such process") > 0:
-                if os.path.exists(self.pidfile):
-                    os.remove(self.pidfile)
-            else:
-                print str(err)
-                sys.exit(1)
-
-    def restart(self):
-        """
-        Restart the daemon
-        """
-        # Get the pid from the pidfile
-        try:
-            pf = file(self.pidfile,'r')
-            pid = int(pf.read().strip())
-            pf.close()
-        except IOError:
-            pid = None
-
-        if pid:
-        # Try killing the daemon process
-            try:
-                while 1:
-                    os.kill(pid, SIGTERM)
-                    time.sleep(0.1)
-            except OSError, err:
-                err = str(err)
-                if err.find("No such process") > 0:
-                    if os.path.exists(self.pidfile):
-                        os.remove(self.pidfile)
-                else:
-                    print str(err)
-                    return 1
-
-        # Start the daemon
-        forkresult = self.daemonize()
-        if forkresult==None:
-            self.run()
-        return forkresult
-
-    def reload(self):
-        """
-        Reload configuration
-        """
-        # Get the pid from the pidfile
-        try:
-            pf = file(self.pidfile,'r')
-            pid = int(pf.read().strip())
-            pf.close()
-        except IOError:
-            pid = None
-
-        if not pid:
-            message = "pidfile %s does not exist. Daemon not running?\n"
-            sys.stderr.write(message % self.pidfile)
-            return 1
-
-        # Try killing the daemon process
-        try:
-            os.kill(pid, signal.SIGUSR1)
-        except OSError, err:
-            print str(err)
-
-    def status(self):
-        """
-        Check daemon status
-        """
-        # Get the pid from the pidfile
-        try:
-            pf = file(self.pidfile,'r')
-            pid = int(pf.read().strip())
-            pf.close()
-        except IOError:
-            pid = None
-
-        if not pid:
-            message = "pidfile %s does not exist. Daemon not running?\n"
-            sys.stderr.write(message % self.pidfile)
-            return 1
-
-    def run(self):
-        """
-        You should override this method when you subclass Daemon. It will be called after the process has been
-        daemonized by start() or restart().
-        """
-
-
-"""
-General architecture notes
-
-
-This is a standalone Eye-Fi Server that is designed to take the place of the Eye-Fi Manager.
-
-
-Starting this server creates a listener on port 59278. I use the BaseHTTPServer class included
-with Python. I look for specific POST/GET request URLs and execute functions based on those
-URLs.
-
-
-
-
-"""
-
-
+#print("Action file: " + args.action[0]) 
+#print("Config file: " + args.configure[0]) 
+#print("Logfile file: " + args.logfile[0]) 
 # Create the main logger
-eyeFiLogger = logging.Logger("eyeFiLogger",logging.DEBUG)
+eyeFiLogger = logging.Logger("eyeFiLogger",args.debug)
 
 # Create two handlers. One to print to the log and one to print to the console
 consoleHandler = logging.StreamHandler(sys.stdout)
@@ -299,11 +91,270 @@ consoleHandler.setFormatter(eyeFiLoggingFormat)
 # Append both handlers to the main Eye Fi Server logger
 eyeFiLogger.addHandler(consoleHandler)
 
+class Daemon(object):
+    """
+    Usage: - create your own a subclass Daemon class and override the run() method. Run() will be periodically the calling inside the infinite run loop
+           - you can receive reload signal from self.isReloadSignal and then you have to set back self.isReloadSignal = False
+    """
+
+    def __init__(self, stdin='/dev/null', stdout='/dev/null', stderr='/dev/null'):
+        self.ver = 0.1  # version
+        self.pauseRunLoop = 0    # 0 means none pause between the calling of run() method.
+        self.restartPause = 1    # 0 means without a pause between stop and start during the restart of the daemon
+        self.waitToHardKill = 3  # when terminate a process, wait until kill the process with SIGTERM signal
+
+        self.isReloadSignal = False
+        self._canDaemonRun = True
+        self.processName = sys.argv[0] #os.path.basename(sys.argv[0])
+        self.stdin = stdin
+        self.stdout = stdout
+        self.stderr = stderr
+
+    def _sigterm_handler(self, signum, frame):
+        self._canDaemonRun = False
+
+    def _reload_handler(self, signum, frame):
+        self.isReloadSignal = True
+
+    def _makeDaemon(self):
+        """
+        Make a daemon, do double-fork magic.
+        """
+
+        try:
+            pid = os.fork()
+            if pid > 0:
+                # Exit first parent.
+                sys.exit(0)
+        except OSError as e:
+            m = f"Fork #1 failed: {e}"
+            print(m)
+            sys.exit(1)
+
+        # Decouple from the parent environment.
+        os.chdir("/")
+        os.setsid()
+        os.umask(0)
+
+        # Do second fork.
+        try:
+            pid = os.fork()
+            if pid > 0:
+                # Exit from second parent.
+                sys.exit(0)
+        except OSError as e:
+            m = f"Fork #2 failed: {e}"
+            print(m)
+            sys.exit(1)
+
+        m = "The daemon process is going to background."
+        print(m)
+
+        # Redirect standard file descriptors.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        si = open(self.stdin, 'r')
+        so = open(self.stdout, 'a+')
+        se = open(self.stderr, 'a+')
+        os.dup2(si.fileno(), sys.stdin.fileno())
+        os.dup2(so.fileno(), sys.stdout.fileno())
+        os.dup2(se.fileno(), sys.stderr.fileno())
+
+    def _getProces(self):
+        procs = []
+
+        for p in psutil.process_iter():
+            if self.processName in p.cmdline(): #[part.split('/')[-1] for part in p.cmdline()]:
+                # Skip  the current process
+                if p.pid != os.getpid():
+                    procs.append(p)
+ 
+        return procs
+
+    def start(self):
+        """
+        Start daemon.
+        """
+
+        # Handle signals
+        signal.signal(signal.SIGINT, self._sigterm_handler)
+        signal.signal(signal.SIGTERM, self._sigterm_handler)
+        signal.signal(signal.SIGHUP, self._reload_handler)
+
+        # Check if the daemon is already running.
+        procs = self._getProces()
+
+        if procs:
+            pids = ",".join([str(p.pid) for p in procs])
+            m = f"Find a previous daemon processes with PIDs {pids}. Is not already the daemon running?"
+            print(m)
+            sys.exit(1)
+        else:
+            m = f"Start the daemon version {self.ver}"
+            print(m)
+
+        # Daemonize the main process
+        self._makeDaemon()
+        # Start a infinitive loop that periodically runs run() method
+        self._infiniteLoop()
+
+    def version(self):
+        m = f"The daemon version {self.ver}"
+        print(m)
+
+    def status(self):
+        """
+        Get status of the daemon.
+        """
+
+        procs = self._getProces()
+
+        if procs:
+            pids = ",".join([str(p.pid) for p in procs])
+            m = f"The daemon is running with PID {pids}."
+            print(m)
+        else:
+            m = "The daemon is not running!"
+            print(m)
+
+    def reload(self):
+        """
+        Reload the daemon.
+        """
+
+        procs = self._getProces()
+
+        if procs:
+            for p in procs:
+                os.kill(p.pid, signal.SIGHUP)
+                m = f"Send SIGHUP signal into the daemon process with PID {p.pid}."
+                print(m)
+        else:
+            m = "The daemon is not running!"
+            print(m)
+
+    def stop(self):
+        """
+        Stop the daemon.
+        """
+
+        procs = self._getProces()
+
+        def on_terminate(process):
+            m = f"The daemon process with PID {process.pid} has ended correctly."
+            print(m)
+
+        if procs:
+            for p in procs:
+                p.terminate()
+
+            gone, alive = psutil.wait_procs(procs, timeout=self.waitToHardKill, callback=on_terminate)
+
+            for p in alive:
+                m = f"The daemon process with PID {p.pid} was killed with SIGTERM!"
+                print(m)
+                p.kill()
+        else:
+            m = "Cannot find some daemon process, I will do nothing."
+            print(m)
+
+    def restart(self):
+        """
+        Restart the daemon.
+        """
+        self.stop()
+
+        if self.restartPause:
+            time.sleep(self.restartPause)
+
+        self.start()
+
+    def _infiniteLoop(self):
+        try:
+            if self.pauseRunLoop:
+                time.sleep(self.pauseRunLoop)
+
+                while self._canDaemonRun:
+                    self.run()
+                    time.sleep(self.pauseRunLoop)
+            else:
+                while self._canDaemonRun:
+                    self.run()
+
+        except Exception as e:
+            m = f"Run method failed: {e}"
+            sys.stderr.write(m)
+            sys.exit(1)
+
+    # this method you have to override
+    def run(self):
+        pass
 
 def fix_ownership(path, uid, gid):
    if uid != -1 and gid != -1:
        os.chown(path, uid, gid)
 
+
+# Implements an EyeFi server
+class EyeFiServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+
+    def serve_forever(self):
+        while self.run:
+            try:
+                self.handle_request()
+            except select.error( e ):
+                if e[0] != errno.EINTR:
+                    raise e
+
+    def reload_config(self, signum, frame):
+        try:
+            configfile = args.configure[0]
+            eyeFiLogger.info("Reloading configuration " + configfile)
+            self.config.read(configfile)
+        except:
+            eyeFiLogger.error("Error reloading configuration")
+
+    def stop_server(self, signum, frame):
+        try:
+            eyeFiLogger.info("Eye-Fi server stopped ")
+            self.stop()
+        except:
+            eyeFiLogger.error("Error stopping server")
+
+    def server_bind(self):
+
+        http.server.HTTPServer.server_bind(self)
+        self.socket.settimeout(None)
+        signal.signal(signal.SIGUSR1, self.reload_config)
+        signal.signal(signal.SIGTERM, self.stop_server)
+        signal.signal(signal.SIGINT, self.stop_server)
+        self.run = True
+
+    def get_request(self):
+        while self.run:
+            try:
+                connection, address = self.socket.accept()
+                eyeFiLogger.debug("Incoming connection from client %s" % address[0])
+
+                connection.settimeout(None)
+                return (connection, address)
+
+            except socket.timeout:
+                self.socket.close()
+                pass
+
+    def stop(self):
+        self.run = False
+
+    # alt serve_forever method for python <2.6
+    # because we want a shutdown mech ..
+    #def serve(self):
+    #  while self.run:
+    #    self.handle_request()
+    #  self.socket.close()
+
+# This class is responsible for handling HTTP requests passed to it.
+# It implements the two most common HTTP methods, do_GET() and do_POST()
 
 # Eye Fi XML SAX ContentHandler
 class EyeFiContentHandler(ContentHandler):
@@ -346,70 +397,9 @@ class EyeFiContentHandler(ContentHandler):
             if self.elementsToExtract[elementName] == True:
                 self.extractedElements[elementName] = content
 
-# Implements an EyeFi server
-class EyeFiServer(SocketServer.ThreadingMixIn, BaseHTTPServer.HTTPServer):
-
-    def serve_forever(self):
-        while self.run:
-            try:
-                self.handle_request()
-            except select.error, e:
-                if e[0] != errno.EINTR:
-                    raise e
-
-    def reload_config(self, signum, frame):
-        try:
-            configfile = sys.argv[2]
-            eyeFiLogger.info("Reloading configuration " + configfile)
-            self.config.read(configfile)
-        except:
-            eyeFiLogger.error("Error reloading configuration")
-
-    def stop_server(self, signum, frame):
-        try:
-            eyeFiLogger.info("Eye-Fi server stopped ")
-            self.stop()
-        except:
-            eyeFiLogger.error("Error stopping server")
-
-    def server_bind(self):
-
-        BaseHTTPServer.HTTPServer.server_bind(self)
-        self.socket.settimeout(None)
-        signal.signal(signal.SIGUSR1, self.reload_config)
-        signal.signal(signal.SIGTERM, self.stop_server)
-        signal.signal(signal.SIGINT, self.stop_server)
-        self.run = True
-
-    def get_request(self):
-        while self.run:
-            try:
-                connection, address = self.socket.accept()
-                eyeFiLogger.debug("Incoming connection from client %s" % address[0])
-
-                connection.settimeout(None)
-                return (connection, address)
-
-            except socket.timeout:
-                self.socket.close()
-                pass
-
-    def stop(self):
-        self.run = False
-
-    # alt serve_forever method for python <2.6
-    # because we want a shutdown mech ..
-    #def serve(self):
-    #  while self.run:
-    #    self.handle_request()
-    #  self.socket.close()
 
 
-
-# This class is responsible for handling HTTP requests passed to it.
-# It implements the two most common HTTP methods, do_GET() and do_POST()
-
-class EyeFiRequestHandler(BaseHTTPRequestHandler):
+class EyeFiRequestHandler(http.server.BaseHTTPRequestHandler):
 
     # pike: these seem unused ?
     protocol_version = 'HTTP/1.1'
@@ -428,11 +418,9 @@ class EyeFiRequestHandler(BaseHTTPRequestHandler):
 
             SOAPAction = ""
             eyeFiLogger.debug("Headers received in GET request:")
-            for headerName in self.headers.keys():
-                for headerValue in self.headers.getheaders(headerName):
-                    eyeFiLogger.debug(headerName + ": " + headerValue)
-                    if( headerName == "soapaction"):
-                        SOAPAction = headerValue
+            for headerName,headerValue in self.headers.items():
+                if( headerName == "SOAPAction"):
+                    SOAPAction = headerValue
 
             self.send_response(200)
             self.send_header('Content-type','text/html')
@@ -456,38 +444,31 @@ class EyeFiRequestHandler(BaseHTTPRequestHandler):
             contentLength = ""
 
             # Loop through all the request headers and pick out ones that are relevant
-
+            contentLength=0
             eyeFiLogger.debug("Headers received in POST request:")
-            for headerName in self.headers.keys():
-                for headerValue in self.headers.getheaders(headerName):
+            for headerName,headerValue in self.headers.items():
+                if( headerName == "SOAPAction"):
+                    SOAPAction = headerValue
 
-                    if( headerName == "soapaction"):
-                        SOAPAction = headerValue
+                if( headerName == "Content-Length"):
+                    contentLength = int(headerValue)
 
-                    if( headerName == "content-length"):
-                        contentLength = int(headerValue)
-
-                    eyeFiLogger.debug(headerName + ": " + headerValue)
+                eyeFiLogger.debug("Header: " +headerName + ": " + headerValue)
 
 
-            # Read contentLength bytes worth of data
+            # Read contentLength byte s worth of data
             eyeFiLogger.debug("Attempting to read " + str(contentLength) + " bytes of data")
             # postData = self.rfile.read(contentLength)
-            try:
-                from StringIO import StringIO
-                import tempfile
-            except ImportError:
-                eyeFiLogger.debug("No StringIO module")
             chunksize = 1048576 # 1MB
-            mem = StringIO()
-            while 1:
-                remain = contentLength - mem.tell()
+
+            mem = io.BytesIO()
+            while True:
+                remain = contentLength - int(mem.tell())
                 if remain <= 0: break
                 chunk = self.rfile.read(min(chunksize, remain))
-                if not chunk: break
+                if not len(chunk): break
                 mem.write(chunk)
-                print remain
-            print "Finished"
+                print( remain )
             postData = mem.getvalue()
             mem.close()
 
@@ -501,7 +482,7 @@ class EyeFiRequestHandler(BaseHTTPRequestHandler):
                 response = self.startSession(postData)
                 contentLength = len(response)
 
-                eyeFiLogger.debug("StartSession response: " + response)
+                eyeFiLogger.debug("StartSession response: " + str(response))
 
                 self.send_response(200)
                 self.send_header('Date', self.date_time_string())
@@ -523,7 +504,7 @@ class EyeFiRequestHandler(BaseHTTPRequestHandler):
                 response = self.getPhotoStatus(postData)
                 contentLength = len(response)
 
-                eyeFiLogger.debug("GetPhotoStatus response: " + response)
+                eyeFiLogger.debug("GetPhotoStatus response: " + str(response))
 
                 self.send_response(200)
                 self.send_header('Date', self.date_time_string())
@@ -543,7 +524,7 @@ class EyeFiRequestHandler(BaseHTTPRequestHandler):
                 response = self.uploadPhoto(postData)
                 contentLength = len(response)
 
-                eyeFiLogger.debug("Upload response: " + response)
+                eyeFiLogger.debug("Upload response: " + str(response))
 
                 self.send_response(200)
                 self.send_header('Date', self.date_time_string())
@@ -562,7 +543,7 @@ class EyeFiRequestHandler(BaseHTTPRequestHandler):
                 response = self.markLastPhotoInRoll(postData)
                 contentLength = len(response)
 
-                eyeFiLogger.debug("MarkLastPhotoInRoll response: " + response)
+                eyeFiLogger.debug("MarkLastPhotoInRoll response: " + str(response))
                 self.send_response(200)
                 self.send_header('Date', self.date_time_string())
                 self.send_header('Pragma','no-cache')
@@ -605,11 +586,11 @@ class EyeFiRequestHandler(BaseHTTPRequestHandler):
     def uploadPhoto(self,postData):
 
         # Take the postData string and work with it as if it were a file object
-        postDataInMemoryFile = StringIO.StringIO(postData)
+        postDataInMemoryFile = io.BytesIO(postData)
 
         # Get the content-type header which looks something like this
         # content-type: multipart/form-data; boundary=---------------------------02468ace13579bdfcafebabef00d
-        contentTypeHeader = self.headers.getheaders('content-type').pop()
+        contentTypeHeader = self.headers['Content-Type']
         eyeFiLogger.debug(contentTypeHeader)
 
         # Extract the boundary parameter in the content-type header
@@ -623,11 +604,11 @@ class EyeFiRequestHandler(BaseHTTPRequestHandler):
         # eyeFiLogger.debug("uploadPhoto postData: " + postData)
 
         # Parse the multipart/form-data
-        form = cgi.parse_multipart(postDataInMemoryFile, {"boundary":boundary,"content-disposition":self.headers.getheaders('content-disposition')})
+        form = cgi.parse_multipart(postDataInMemoryFile, {"boundary":boundary.encode(),"content-disposition":self.headers['content-disposition']})
         eyeFiLogger.debug("Available multipart/form-data: " + str(form.keys()))
 
         # Parse the SOAPENVELOPE using the EyeFiContentHandler()
-        soapEnvelope = form['SOAPENVELOPE'][0]
+        soapEnvelope = form['SOAPENVELOPE'][0].decode()
         eyeFiLogger.debug("SOAPENVELOPE: " + soapEnvelope)
         handler = EyeFiContentHandler()
         parser = xml.sax.parseString(soapEnvelope,handler)
@@ -665,7 +646,7 @@ class EyeFiRequestHandler(BaseHTTPRequestHandler):
         eyeFiLogger.debug("Extracting TAR file " + imageTarPath)
         try:
             imageTarfile = tarfile.open(imageTarPath)
-        except ReadError, error:
+        except ReadError( error ):
             eyeFiLogger.error("Failed to open %s" % imageTarPath)
             raise
 
@@ -677,7 +658,7 @@ class EyeFiRequestHandler(BaseHTTPRequestHandler):
             else:
                 timeoffset = time.timezone
             timezone = timeoffset / 60 / 60 * -1
-            imageDate = datetime.fromtimestamp(member.mtime) - timedelta(hours=timezone)
+            imageDate = datetime.datetime.fromtimestamp(member.mtime) - datetime.timedelta(hours=timezone)
             uploadDir = imageDate.strftime(self.server.config.get('EyeFiServer','upload_dir'))
             eyeFiLogger.debug("Creating folder " + uploadDir)
             if not os.path.isdir(uploadDir):
@@ -944,35 +925,27 @@ class EyeFiRequestHandler(BaseHTTPRequestHandler):
 
         return doc.toxml(encoding="UTF-8")
 
-def stopEyeFi():
-    configfile = sys.argv[2]
-    eyeFiLogger.info("Reading config " + configfile)
-
-    config = ConfigParser.SafeConfigParser(defaults=DEFAULTS)
-    config.read(configfile)
-
-    port = config.getint('EyeFiServer','host_port')
-
-    """send QUIT request to http server running on localhost:<port>"""
-    conn = httplib.HTTPConnection("127.0.0.1:%d" % port)
-    conn.request("QUIT", "/")
-    conn.getresponse()
 
 eyeFiServer=''
 
 def runEyeFi():
 
-    configfile = sys.argv[2]
-    eyeFiLogger.info("Reading config " + configfile)
-
-    config = ConfigParser.SafeConfigParser(defaults=DEFAULTS)
-    config.read(configfile)
 
     # open file logging
-    logfile = sys.argv[3]
+    logfile = args.logfile[0]
     fileHandler = logging.handlers.TimedRotatingFileHandler(logfile, "D", 7, backupCount=7, encoding=None)
     fileHandler.setFormatter(eyeFiLoggingFormat)
     eyeFiLogger.addHandler(fileHandler)
+
+    configfile = args.configure[0]
+    eyeFiLogger.info("Reading config " + configfile)
+
+    config = configparser.ConfigParser()
+    if not(config.read(configfile)):
+        eyeFiLogger.fatal("Could not read config file: "+configfile )
+        exit( 1 )
+
+    eyeFiLogger.debug("Loaded configuration: "+ str(config.sections()))
 
     server_address = (config.get('EyeFiServer','host_name'), config.getint('EyeFiServer','host_port'))
 
@@ -983,48 +956,42 @@ def runEyeFi():
     eyeFiLogger.info("Eye-Fi server started listening on port " + str(server_address[1]))
     eyeFiServer.serve_forever()
 
+
 class MyDaemon(Daemon):
     def run(self):
         runEyeFi()
 
+
 def main():
     pid_file = '/tmp/eyefiserver.pid'
+    daemon = MyDaemon()
     result = 0
-    if len(sys.argv) > 2:
-        if 'start' == sys.argv[1]:
-            daemon = MyDaemon(pid_file)
-            result = daemon.start()
-            if result!=1:
-                print "EyeFiServer started"
-        elif 'stop' == sys.argv[1]:
-            daemon = MyDaemon(pid_file)
-            result = daemon.stop()
-            if result!=1:
-                print "EyeFiServer stopped"
-        elif 'restart' == sys.argv[1]:
-            daemon = MyDaemon(pid_file)
-            result = daemon.restart()
-            if result!=1:
-                print "EyeFiServer restarted"
-        elif 'reload' == sys.argv[1]:
-            daemon = MyDaemon(pid_file)
-            result = daemon.reload()
-        elif 'status' == sys.argv[1]:
-            daemon = MyDaemon(pid_file)
-            result = daemon.status()
-            if result==1:
-                print "EyeFiServer is not running"
-            else:
-                print "EyeFiServer is running"
-        elif 'instance' == sys.argv[1]:
-            runEyeFi()
+    if 'start' == args.action[0]:
+        result = daemon.start()
+        if result!=1:
+            print( "EyeFiServer started" )
+    elif 'stop' == args.action[0]:
+        result = daemon.stop()
+        if result!=1:
+            print( "EyeFiServer stopped" )
+    elif 'restart' == args.action[0]:
+        result = daemon.restart()
+        if result!=1:
+            print( "EyeFiServer restarted" )
+    elif 'reload' == args.action[0]:
+        result = daemon.reload()
+    elif 'status' == args.action[0]:
+        result = daemon.status()
+        if result==1:
+            print( "EyeFiServer is not running" )
         else:
-            print "Unknown command"
-            sys.exit(2)
-        sys.exit(result)
+            print( "EyeFiServer is running" )
+    elif 'instance' == args.action[0]:
+        runEyeFi()
     else:
-        print "usage: %s start|stop|restart|reload|status|instance conf_file log_file" % sys.argv[0]
+        print( "Unknown command" )
         sys.exit(2)
+        sys.exit(result)
 
 if __name__ == "__main__":
     main()
